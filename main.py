@@ -1,106 +1,150 @@
 import os
+import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import yfinance as yf
+import pandas as pd
+import ta
+import requests
 
-# Small web server so Render port check passes
+# ==========================================
+# 1. BACKGROUND WEB SERVER (FOR RENDER)
+# ==========================================
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is online and scanning!")
 
+    def log_message(self, format, *args):
+        return  # Suppress HTTP server noise in Render logs
+
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), SimpleHandler)
     server.serve_forever()
 
-# Run web server in a background thread
 threading.Thread(target=run_server, daemon=True).start()
 
-import yfinance as yf
-import pandas as pd
-import requests
-import time
+# ==========================================
+# 2. TELEGRAM CONFIGURATION
+# ==========================================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-BOT_TOKEN = "8367707879:AAFG1UDCboyk5zSjPxpVRpElhIT9HaVzFos"
-CHAT_ID = "7167357252"
+def send_telegram_signal(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[Signal Alert]\n{message}")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
-# Assets to scan
-WATCHLIST = {
+# ==========================================
+# 3. YAHOO FINANCE SAFE FETCH (RATE-LIMIT FIX)
+# ==========================================
+def safe_get_data(symbol, period="5d", interval="5m", max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, interval=interval)
+            if not df.empty and len(df) >= 200:
+                return df
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e) or "crumb" in str(e).lower():
+                wait_time = 5 * (attempt + 1)
+                print(f"[!] Rate limit on {symbol}. Waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                time.sleep(2)
+    return None
+
+# ==========================================
+# 4. ASSETS & STRATEGY ENGINE
+# ==========================================
+PAIRS = {
     "EURUSD=X": "EUR/USD",
     "GBPUSD=X": "GBP/USD",
     "USDJPY=X": "USD/JPY",
     "AUDUSD=X": "AUD/USD",
     "USDCAD=X": "USD/CAD",
-    "GC=F":     "Gold (XAU/USD)"
+    "GC=F": "XAU/USD (Gold)"
 }
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+def analyze_and_signal(symbol, name):
+    df = safe_get_data(symbol)
+    if df is None or len(df) < 200:
+        return
 
-# Startup alert
-send_telegram("🌍 *24/7 CLOUD SCANNER ONLINE!*\n\nScanning EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, and Gold continuously from Render.")
+    # Calculate Indicators
+    df['EMA_200'] = ta.trend.ema_indicator(df['Close'], window=200)
+    df['EMA_50'] = ta.trend.ema_indicator(df['Close'], window=50)
+    df['EMA_20'] = ta.trend.ema_indicator(df['Close'], window=20)
+    df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
 
-last_signals = {ticker: "NEUTRAL" for ticker in WATCHLIST}
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
+    close = latest['Close']
+    ema200 = latest['EMA_200']
+    ema50 = latest['EMA_50']
+    ema20 = latest['EMA_20']
+    rsi = latest['RSI']
+
+    prev_ema20 = prev['EMA_20']
+    prev_ema50 = prev['EMA_50']
+
+    # BUY Logic: 20 EMA crosses above 50 EMA, both above 200 EMA, RSI > 50
+    bullish_cross = (prev_ema20 <= prev_ema50) and (ema20 > ema50)
+    if bullish_cross and (ema20 > ema200) and (ema50 > ema200) and (rsi > 50):
+        sl = round(close - (close * 0.0015), 5) if "GC=F" not in symbol else round(close - 3.0, 2)
+        tp = round(close + (close * 0.0030), 5) if "GC=F" not in symbol else round(close + 6.0, 2)
+        
+        msg = (
+            f"🚨 *BUY SIGNAL GENERATED*\n\n"
+            f"📈 *Asset:* {name}\n"
+            f"💵 *Entry:* {close:.5f}\n"
+            f"🛑 *Stop Loss:* {sl}\n"
+            f"🎯 *Take Profit:* {tp}\n"
+            f"📊 *RSI:* {rsi:.2f}\n"
+            f"⚡ *Lot Size:* 0.01\n\n"
+            f"⏱ *Rule:* Execute within 2 minutes!"
+        )
+        send_telegram_signal(msg)
+
+    # SELL Logic: 20 EMA crosses below 50 EMA, both below 200 EMA, RSI < 50
+    bearish_cross = (prev_ema20 >= prev_ema50) and (ema20 < ema50)
+    if bearish_cross and (ema20 < ema200) and (ema50 < ema200) and (rsi < 50):
+        sl = round(close + (close * 0.0015), 5) if "GC=F" not in symbol else round(close + 3.0, 2)
+        tp = round(close - (close * 0.0030), 5) if "GC=F" not in symbol else round(close - 6.0, 2)
+        
+        msg = (
+            f"🚨 *SELL SIGNAL GENERATED*\n\n"
+            f"📉 *Asset:* {name}\n"
+            f"💵 *Entry:* {close:.5f}\n"
+            f"🛑 *Stop Loss:* {sl}\n"
+            f"🎯 *Take Profit:* {tp}\n"
+            f"📊 *RSI:* {rsi:.2f}\n"
+            f"⚡ *Lot Size:* 0.01\n\n"
+            f"⏱ *Rule:* Execute within 2 minutes!"
+        )
+        send_telegram_signal(msg)
+
+# ==========================================
+# 5. MAIN SCANNING LOOP
+# ==========================================
+print("Forex Signal Bot started successfully!")
 while True:
-    print("\n--- Starting Full Market Scan ---")
-    
-    for ticker, name in WATCHLIST.items():
+    print("Starting market scan...")
+    for symbol, name in PAIRS.items():
         try:
-            df = yf.download(tickers=ticker, period="5d", interval="15m", progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            if df.empty or len(df) < 200:
-                continue
-
-            df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-            df['EMA_50']  = df['Close'].ewm(span=50, adjust=False).mean()
-            df['EMA_20']  = df['Close'].ewm(span=20, adjust=False).mean()
-
-            delta = df['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            df['RSI'] = 100 - (100 / (1 + rs))
-
-            latest = df.iloc[-1]
-            price = round(float(latest['Close']), 4 if "JPY" in ticker or "GC=F" in ticker else 5)
-            ema200 = round(float(latest['EMA_200']), 5)
-            ema50 = round(float(latest['EMA_50']), 5)
-            ema20 = round(float(latest['EMA_20']), 5)
-            rsi = round(float(latest['RSI']), 2)
-
-            current_signal = "NEUTRAL"
-            if price > ema200 and ema20 > ema50 and 50 <= rsi <= 70:
-                current_signal = "BUY"
-            elif price < ema200 and ema20 < ema50 and 30 <= rsi <= 50:
-                current_signal = "SELL"
-
-            pip_offset = 0.50 if "GC=F" in ticker else (0.15 if "JPY" in ticker else 0.0015)
-
-            if current_signal != "NEUTRAL" and current_signal != last_signals[ticker]:
-                last_signals[ticker] = current_signal
-                
-                if current_signal == "BUY":
-                    sl = round(price - pip_offset, 4 if "GC=F" in ticker else 5)
-                    tp = round(price + (pip_offset * 2), 4 if "GC=F" in ticker else 5)
-                    msg = f"🟢 *HIGH PROBABILITY BUY SIGNAL*\n\n• Asset: *{name}*\n• Entry Price: `{price}`\n• Stop Loss: `{sl}`\n• Take Profit: `{tp}`\n• RSI: `{rsi}`"
-                else:
-                    sl = round(price + pip_offset, 4 if "GC=F" in ticker else 5)
-                    tp = round(price - (pip_offset * 2), 4 if "GC=F" in ticker else 5)
-                    msg = f"🔴 *HIGH PROBABILITY SELL SIGNAL*\n\n• Asset: *{name}*\n• Entry Price: `{price}`\n• Stop Loss: `{sl}`\n• Take Profit: `{tp}`\n• RSI: `{rsi}`"
-
-                send_telegram(msg)
-                print(f"🚨 SIGNAL FIRED: {name} -> {current_signal} at {price}")
-            else:
-                print(f"  • {name}: {current_signal} | Price: {price} | RSI: {rsi}")
-
+            analyze_and_signal(symbol, name)
         except Exception as e:
-            print(f"  • Error scanning {name}: {e}")
-
+            print(f"Error scanning {name}: {e}")
+        time.sleep(2)  # 2-second delay between pairs prevents rate limits
+    
+    print("Scan complete. Waiting 15 minutes for next cycle...")
     time.sleep(900)
-          
