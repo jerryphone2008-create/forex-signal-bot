@@ -8,13 +8,19 @@ import ta
 import requests
 
 # ==========================================
-# 1. BACKGROUND WEB SERVER (FOR RENDER)
+# 1. BACKGROUND WEB SERVER (FIXES 501 HEAD ERROR)
 # ==========================================
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/html")
         self.end_headers()
         self.wfile.write(b"Bot is online and scanning!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
 
     def log_message(self, format, *args):
         return  # Suppress HTTP server noise in Render logs
@@ -97,7 +103,7 @@ def analyze_and_signal(symbol, name):
     prev_ema20 = prev['EMA_20']
     prev_ema50 = prev['EMA_50']
 
-    # BUY Logic: 20 EMA crosses above 50 EMA, both above 200 EMA, RSI > 50
+    # BUY Logic
     bullish_cross = (prev_ema20 <= prev_ema50) and (ema20 > ema50)
     if bullish_cross and (ema20 > ema200) and (ema50 > ema200) and (rsi > 50):
         sl = round(close - (close * 0.0015), 5) if "GC=F" not in symbol else round(close - 3.0, 2)
@@ -115,7 +121,7 @@ def analyze_and_signal(symbol, name):
         )
         send_telegram_signal(msg)
 
-    # SELL Logic: 20 EMA crosses below 50 EMA, both below 200 EMA, RSI < 50
+    # SELL Logic
     bearish_cross = (prev_ema20 >= prev_ema50) and (ema20 < ema50)
     if bearish_cross and (ema20 < ema200) and (ema50 < ema200) and (rsi < 50):
         sl = round(close + (close * 0.0015), 5) if "GC=F" not in symbol else round(close + 3.0, 2)
@@ -144,7 +150,8 @@ while True:
             analyze_and_signal(symbol, name)
         except Exception as e:
             print(f"Error scanning {name}: {e}")
-        time.sleep(2)  # 2-second delay between pairs prevents rate limits
+        time.sleep(2)
     
     print("Scan complete. Waiting 15 minutes for next cycle...")
     time.sleep(900)
+            
